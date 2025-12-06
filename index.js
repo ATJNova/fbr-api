@@ -7,10 +7,10 @@ const app = express();
 app.use(bodyParser.json());
 app.use(cors());
 
-// Secret API key for Excel authentication
-const API_KEY = "YOUR_SECRET_KEY";
+// Secret API key
+const API_KEY = "12345";
 
-// Security middleware
+// Middleware to check API key
 app.use((req, res, next) => {
     const key = req.headers["x-api-key"];
     if (key !== API_KEY) {
@@ -24,10 +24,9 @@ app.post("/submitInvoice", async (req, res) => {
     const invoice = req.body;
     try {
         // TODO: Replace with real FBR API call
-        // Example:
-        // await axios.post("FBR_API_ENDPOINT", invoice);
+        // Example: await axios.post("FBR_API_ENDPOINT", invoice);
 
-        // Mock response
+        // Mock response for testing
         res.json({
             status: "success",
             message: `Invoice ${invoice.invoiceNumber} submitted successfully!`
@@ -40,3 +39,4 @@ app.post("/submitInvoice", async (req, res) => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API running on port ${PORT}`));
+
