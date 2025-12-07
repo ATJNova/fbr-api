@@ -1,61 +1,86 @@
-const express = require("express");
-const bodyParser = require("body-parser");
-const axios = require("axios");
-const cors = require("cors");
+// index.js — FBR forwarder that returns raw FBR responses (no wrapper)
+const express = require('express');
+const bodyParser = require('body-parser');
+const axios = require('axios');
+const https = require('https');
 
 const app = express();
-app.use(cors());
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '12mb' }));
+
+// Optional API key protection: set FBR_API_KEYS="key1,key2" in env to enable.
+// If no keys set, the proxy allows requests (same behavior as direct VBA->FBR).
+const VALID_KEYS = (process.env.FBR_API_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
+
+function requireApiKey(req, res, next) {
+if (VALID_KEYS.length === 0) return next();
+const key = req.header('x-api-key') || req.query.api_key || (req.header('authorization') || '').replace(/^Bearer\s+/i,'');
+if (!key) return res.status(401).send('Missing API key');
+if (!VALID_KEYS.includes(key)) return res.status(403).send('Invalid API key');
+next();
+}
+
+function buildAxiosConfig(incomingAuthHeader) {
+const headers = { 'Content-Type': 'application/json' };
+if (incomingAuthHeader) headers['Authorization'] = incomingAuthHeader;
+
+const cfg = { headers, timeout: 60000, responseType: 'text' };
+
+// Mutual TLS support (if you set FBR_PFX_BASE64 in Railway env)
+if (process.env.FBR_PFX_BASE64) {
+try {
+const pfx = Buffer.from(process.env.FBR_PFX_BASE64, 'base64');
+const passphrase = process.env.FBR_PFX_PASS || '';
+cfg.httpsAgent = new https.Agent({ pfx, passphrase, rejectUnauthorized: true });
+} catch (e) {
+console.error('Error loading PFX:', e.message);
+}
+}
+return cfg;
+}
+
+function getFbrUrl(action, env) {
+// action: 'validate' or 'post'
+const e = (env || '').toLowerCase();
+if (action === 'validate') {
+return e === 'sandbox'
+? (process.env.FBR_VALIDATE_SB || 'https://gw.fbr.gov.pk/di_data/v1/di/validateinvoicedata_sb')
+: (process.env.FBR_VALIDATE || 'https://gw.fbr.gov.pk/di_data/v1/di/validateinvoicedata');
+}
+// post
+return e === 'sandbox'
+? (process.env.FBR_POST_SB || 'https://gw.fbr.gov.pk/di_data/v1/di/postinvoicedata_sb')
+: (process.env.FBR_POST || 'https://gw.fbr.gov.pk/di_data/v1/di/postinvoicedata');
+}
+
+async function forward(action, req, res) {
+try {
+const env = req.body.__env || req.header('x-env') || 'production';
+const targetUrl = getFbrUrl(action, env);
+const authHeader = req.header('Authorization') || req.header('authorization') || '';
+const cfg = buildAxiosConfig(authHeader);
+
+// Forward the exact body as sent by VBA (no modification)
+const r = await axios.post(targetUrl, req.body, cfg);
+
+// r.data is text (responseType: 'text'), return it raw with the original status code
+res.status(r.status || 200).type('application/json').send(r.data);
+} catch (err) {
+// If FBR returned an error with text body, return that text & status to VBA
+if (err.response) {
+const status = err.response.status || 500;
+const data = err.response.data || (err.response.text || JSON.stringify(err.response));
+return res.status(status).type('application/json').send(data);
+}
+console.error('Forward error:', err.message);
+return res.status(500).send(JSON.stringify({ error: err.message }));
+}
+}
+
+app.post('/validate', requireApiKey, async (req, res) => forward('validate', req, res));
+app.post('/post', requireApiKey, async (req, res) => forward('post', req, res));
+
+// Health-check
+app.get('/health', (req, res) => res.json({ ok: true, now: new Date().toISOString() }));
 
 const PORT = process.env.PORT || 3000;
-
-// Simple API key check
-const API_KEY = process.env.API_KEY || "12345";
-
-app.post("/submitInvoice", async (req, res) => {
-  try {
-    const key = req.headers["x-api-key"];
-    if (key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
-
-    const { env, token, invoice, items } = req.body;
-
-    // FBR URLs
-    const baseURL = env === "sandbox" ? "https://gw.fbr.gov.pk/di_data/v1/di/" : "https://gw.fbr.gov.pk/di_data/v1/di/";
-    const validateURL = baseURL + (env === "sandbox" ? "validateinvoicedata_sb" : "validateinvoicedata");
-    const postURL = baseURL + (env === "sandbox" ? "postinvoicedata_sb" : "postinvoicedata");
-
-    const payload = { ...invoice, items };
-
-    // Step 1: Validate
-    const valResp = await axios.post(validateURL, payload, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-
-    if (!["00", "valid"].some(v => JSON.stringify(valResp.data).toLowerCase().includes(v))) {
-      return res.json({ error: valResp.data.reason || valResp.data.message || "Validation failed" });
-    }
-
-    // Step 2: Submit Invoice
-    const postResp = await axios.post(postURL, payload, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-
-    const irn = postResp.data.invoiceNumber;
-    if (!irn) return res.json({ error: "No IRN returned by FBR" });
-
-    // Step 3: Generate QR code base64
-    const qrResp = await axios.get(`https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${irn}`, {
-      responseType: "arraybuffer"
-    });
-
-    const qrBase64 = Buffer.from(qrResp.data, "binary").toString("base64");
-
-    res.json({ irn, qrCode: "data:image/png;base64," + qrBase64 });
-
-  } catch (err) {
-    res.json({ error: err.message });
-  }
-});
-
-app.listen(PORT, () => console.log(`FBR API running on port ${PORT}`));
-
+app.listen(PORT, () => console.log(`FBR proxy running on port ${PORT}`));
