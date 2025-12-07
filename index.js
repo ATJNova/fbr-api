@@ -1,4 +1,4 @@
-// index.js — FBR forwarder that returns raw FBR responses (no wrapper)
+// index.js — debug-enabled FBR forwarder (paste replace)
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
@@ -11,10 +11,12 @@ app.use(bodyParser.json({ limit: '12mb' }));
 // If no keys set, the proxy allows requests (same behavior as direct VBA->FBR).
 const VALID_KEYS = (process.env.FBR_API_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
 
+// requireApiKey now checks only x-api-key / query param, NOT the Authorization header.
+// This prevents your Bearer token from being misinterpreted as API key.
 function requireApiKey(req, res, next) {
 if (VALID_KEYS.length === 0) return next();
-const key = req.header('x-api-key') || req.query.api_key || (req.header('authorization') || '').replace(/^Bearer\s+/i,'');
-if (!key) return res.status(401).send('Missing API key');
+const key = req.header('x-api-key') || req.query.api_key || '';
+if (!key) return res.status(401).send('Missing API key (x-api-key header)');
 if (!VALID_KEYS.includes(key)) return res.status(403).send('Invalid API key');
 next();
 }
@@ -39,14 +41,12 @@ return cfg;
 }
 
 function getFbrUrl(action, env) {
-// action: 'validate' or 'post'
 const e = (env || '').toLowerCase();
 if (action === 'validate') {
 return e === 'sandbox'
 ? (process.env.FBR_VALIDATE_SB || 'https://gw.fbr.gov.pk/di_data/v1/di/validateinvoicedata_sb')
 : (process.env.FBR_VALIDATE || 'https://gw.fbr.gov.pk/di_data/v1/di/validateinvoicedata');
 }
-// post
 return e === 'sandbox'
 ? (process.env.FBR_POST_SB || 'https://gw.fbr.gov.pk/di_data/v1/di/postinvoicedata_sb')
 : (process.env.FBR_POST || 'https://gw.fbr.gov.pk/di_data/v1/di/postinvoicedata');
@@ -54,21 +54,32 @@ return e === 'sandbox'
 
 async function forward(action, req, res) {
 try {
+// --- Debug logging: headers and small body preview
+try {
+console.log('--- INCOMING REQUEST ---');
+console.log('Path:', req.path);
+console.log('Headers:', JSON.stringify(req.headers, null, 2));
+const preview = JSON.stringify(req.body).slice(0, 1200);
+console.log('Body preview:', preview);
+console.log('------------------------');
+} catch (logErr) {
+console.error('Logging error:', logErr && logErr.message);
+}
+
 const env = req.body.__env || req.header('x-env') || 'production';
 const targetUrl = getFbrUrl(action, env);
+// prefer full Authorization header if present; fallback to empty string
 const authHeader = req.header('Authorization') || req.header('authorization') || '';
 const cfg = buildAxiosConfig(authHeader);
 
-// Forward the exact body as sent by VBA (no modification)
 const r = await axios.post(targetUrl, req.body, cfg);
 
-// r.data is text (responseType: 'text'), return it raw with the original status code
 res.status(r.status || 200).type('application/json').send(r.data);
 } catch (err) {
-// If FBR returned an error with text body, return that text & status to VBA
 if (err.response) {
 const status = err.response.status || 500;
 const data = err.response.data || (err.response.text || JSON.stringify(err.response));
+console.error('FBR responded with error status:', status, 'body preview:', JSON.stringify(data).slice(0,1000));
 return res.status(status).type('application/json').send(data);
 }
 console.error('Forward error:', err.message);
@@ -79,8 +90,8 @@ return res.status(500).send(JSON.stringify({ error: err.message }));
 app.post('/validate', requireApiKey, async (req, res) => forward('validate', req, res));
 app.post('/post', requireApiKey, async (req, res) => forward('post', req, res));
 
-// Health-check
 app.get('/health', (req, res) => res.json({ ok: true, now: new Date().toISOString() }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`FBR proxy running on port ${PORT}`));
+
